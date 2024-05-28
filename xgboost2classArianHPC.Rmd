@@ -1,0 +1,976 @@
+---
+title: "dataprep"
+output: html_document
+date: "2024-05-22"
+---
+
+
+```{r}
+library(doParallel) 
+library(dplyr) 
+library(ggraph) 
+library(haven) 
+library(knitr) 
+library(mice) 
+library(missForest) 
+library(readxl)
+library(tidyverse) 
+library(xgboost) 
+library(archdata) 
+library(Boruta) 
+library(broom) 
+library(caret) 
+library(Ckmeans.1d.dp) 
+library(ComplexHeatmap)
+library(corrr)
+library(igraph)
+library(openxlsx) 
+library(pROC) 
+library(purrr)
+library(tibble)
+library(randomForest)
+library(rBayesianOptimization)
+```
+
+#DATA preparation
+```{r}
+
+metaData <-
+  read_dta("/data/gent/vo/001/gvo00174/metadata/metadata_for_sharing.dta") %>% 
+  rename(idBiospe = idbs) %>% 
+  relocate(idBiospe) %>% 
+  mutate(idBiospe = as.numeric(idBiospe)) %>% 
+  arrange(idBiospe)
+
+```
+
+```{r}
+
+numCores <- 
+  detectCores() - 1
+
+registerDoParallel(cores=numCores)
+
+metaDataMethylome <-
+  read_csv("/data/gent/vo/001/gvo00174/methylome/sampleSheet.csv")
+
+methylome <- read_csv("/data/gent/vo/001/gvo00174/methylome/20240411MethylomeDataBetasWithProbId.csv") %>% 
+  column_to_rownames(var = "ProbeID") %>%  
+  t() %>%  
+  as.data.frame() %>%  
+  rownames_to_column(var = "Basename") %>%  
+  left_join(metaDataMethylome %>% select(Basename, Sample_ID), by = "Basename") %>%  
+  select(-Basename) %>%  
+  rename(idBiospe = Sample_ID) %>%  
+  relocate(idBiospe) %>%  
+  left_join(metaData %>% select(idBiospe, treatment1_prenatal_n), by = "idBiospe") %>%
+  rename(class = treatment1_prenatal_n) %>%  
+  mutate(timePoint = "acco") %>%  
+  arrange(timePoint, idBiospe) %>%
+  relocate(timePoint, idBiospe, class)
+
+stopImplicitCluster()
+
+remove(numCores)
+
+```
+
+```{r}
+
+impute_table <- function(inputTable) {
+  # Split according to timepoint
+  sub_tables <- split(inputTable, inputTable$timePoint)
+  
+  # Impute each sub-table separately with missForest
+  imputed_tables <- lapply(sub_tables, function(sub_table) {
+  predictors <- sub_table[,5:ncol(sub_table)]
+  
+  class <-
+    sub_table$class %>%
+    factor()
+  
+  imputed_table <-
+    data.frame(class, predictors) %>%
+    missForest()
+  
+  return(imputed_table$ximp)
+})
+  
+  tableBorutaImputed <- 
+    do.call(rbind, imputed_tables) %>%
+    rownames_to_column(var = "row_id") %>%
+    mutate(
+      timePoint = rep(unique(inputTable$timePoint), sapply(imputed_tables, nrow)),
+      idBiospe = inputTable$idBiospe,
+      class = inputTable$class, 
+      dyad = inputTable$dyad
+    ) %>%
+    select(timePoint, idBiospe, class, everything()) %>%
+    select(-row_id) %>%
+    as.data.frame()
+  
+  return(tableBorutaImputed)
+}
+```
+
+```{r}
+tableBorutaImputed <- impute_table(methylome)
+print(tableBorutaImputed)
+```
+
+
+```{r}
+a7 <-
+  methylome %>% 
+  select(-c(idBiospe, timePoint)) 
+
+```
+
+#XGboost 
+
+```{r}
+# Record start time
+
+startTime <- Sys.time()
+```
+
+```{r}
+data <-
+ a7
+```
+
+```{r}
+file_name <- 'a7'
+
+```
+
+#split dataset
+```{r}
+
+# Set seed for reproducibility
+
+set.seed(123)
+
+# Split data into training and testing datasets
+
+splitIndex <- 
+  sample(1:nrow(data), size = 0.75 * nrow(data))
+
+# Prepare feature matrix (xMatrix) and target vector (yVector)
+
+xMatrix <- 
+  data %>% select(-class) %>% 
+  as.matrix()
+
+yVector <- 
+  data$class
+
+# Create training and testing datasets
+
+trainData <- 
+  xMatrix[splitIndex,] %>% 
+  as.matrix()
+
+trainLabels <- 
+  yVector[splitIndex]
+
+testData <- 
+  xMatrix[-splitIndex,] %>% 
+  as.matrix()
+
+testLabels <- 
+  yVector[-splitIndex]
+
+remove(splitIndex, 
+       xMatrix, 
+       yVector)
+
+```
+
+```{r}
+numCores <- 
+  detectCores() - 1 # Use one less than the total number of cores
+
+registerDoParallel(cores = numCores)
+```
+
+
+```{r}
+
+# Create DMatrix for XGBoost
+
+trainXGBDMatrix <- 
+  xgb.DMatrix(data = trainData, 
+              label = trainLabels)
+
+# Define XGBoost parameters for binary classification
+
+xGBParameters <- 
+  list(objective = "binary:logistic", 
+       eval_metric = "logloss")
+
+# Specify number of rounds for cross-validation
+
+numberRounds <- 
+  50
+
+numberFolds <- 
+  5
+
+# Perform cross-validation
+
+modelXGBCvInitial <- 
+  xgb.cv(
+    params = xGBParameters,
+         data = trainXGBDMatrix, 
+         nrounds = numberRounds,
+        # early_stopping_rounds = 10, # Eva: test it
+         nfold = numberFolds,
+         verbose = 0, 
+         prediction = TRUE, 
+         showsd = TRUE,
+         stratified = TRUE, 
+         metrics = c("logloss", "error"))
+
+# 'params' specifies the hyperparameters for the XGBoost algorithm. This includes things like the objective function, learning rate, max depth of trees, etc.
+# 'data' specifies the training data. trainXGBDMatrix is an XGBoost DMatrix object, which is a specialized data structure for XGBoost that supports efficient storage and computation.
+# 'nrounds' specifies the number of boosting rounds or trees to build. This is essentially the number of iterations the boosting process undergoes.
+# 'nfold' specifies the number of folds for the cross-validation. For example, if nfold=5, it means the data is split into 5 parts, with each part used once as a validation while the others form the training set.
+# 'verbose' controls the verbosity of output messages. Setting it to 0 suppresses messages, while higher values increase the amount of output information.
+# 'prediction' when set to TRUE, makes the function return out-of-fold predictions for each fold. This is useful for evaluating the model's performance.
+# 'showsd' when set to TRUE, includes the standard deviation of the evaluation metric across the folds in the output. This gives an idea of how stable the model's performance is across different folds.
+# 'stratified' when set to TRUE, ensures stratified sampling. In classification problems, this means that each fold will contain approximately the same proportions of the target classes as the full dataset. It's useful for dealing with imbalanced datasets.
+# 'metrics' specifies the evaluation metrics to be monitored during the training. "logloss" stands for logarithmic loss, which is a measure for classification models. "error" refers to the classification error rate. Both are used to evaluate the model's performance.
+
+# Assuming `modelCv` contains the results from xgb.cv
+
+testLogLoss <- 
+  modelXGBCvInitial$evaluation_log$test_logloss_mean
+
+numberRoundsBest <- 
+  which.min(testLogLoss)
+
+# Then train the model using this best number of rounds
+
+modelXGBCvFinal <- 
+  xgb.train(params = xGBParameters, 
+            data = trainXGBDMatrix, 
+            nrounds = numberRoundsBest)
+
+# Optionally, you could evaluate model performance on the training dataset as well
+
+trainPredictions <- 
+  predict(modelXGBCvFinal, 
+          newdata = trainXGBDMatrix)
+
+trainPredictionsBinary <- 
+  ifelse(trainPredictions > 0.5, 1, 0)
+
+trainConfusionMatrix <- 
+  confusionMatrix(factor(trainPredictionsBinary), 
+                  factor(trainLabels), 
+                  mode = "everything")
+
+# Print the confusion matrix for the training dataset
+
+print(trainConfusionMatrix)
+
+# Predict on the training dataset with probabilities
+
+trainPredictions <- 
+  predict(modelXGBCvFinal, 
+          newdata = trainXGBDMatrix)
+
+# Generate ROC curve object for the training dataset
+
+trainRoc <- 
+  roc(response = trainLabels, 
+      predictor = trainPredictions)
+
+# Calculate the Area Under the Curve (AUC) for the training dataset
+
+trainAuc <- 
+  auc(trainRoc)
+
+# Print AUC for the training dataset
+
+print(trainAuc)
+
+# Export confusion matrix
+
+termAndEstimateXGBTrain <-
+  tidy(trainConfusionMatrix) %>% 
+  filter(term %in% "accuracy") %>% 
+  select(conf.low, conf.high, p.value) %>% 
+  pivot_longer(everything(),
+               names_to = "term",
+               values_to = "estimate")
+
+confusionMatrixXGBTrain <-
+  tidy(trainConfusionMatrix) %>% 
+  mutate(estimate = case_when(
+    term == "mcnemar" ~ p.value,
+    TRUE ~ estimate)) %>% 
+  select(term, estimate) %>% 
+  bind_rows(termAndEstimateXGBTrain) %>% 
+  bind_rows(tibble(term = "auc",
+                   estimate = as.numeric(trainAuc))) %>% 
+  mutate(cellSpot = file_name) %>% 
+  mutate(model = "train") %>% 
+  arrange(match(term, c("accuracy", "conf.low", "conf.high", "p.value"))) %>% 
+  mutate(term = case_when(
+    term == "conf.low" ~ "ciLow",
+    term == "conf.high" ~ "ciHigh",
+    term == "p.value" ~ "pValue",
+    term == "pos_pred_value" ~ "positivePredictiveValue",
+    term == "neg_pred_value" ~ "negativePredictiveValue",
+    term == "detection_rate" ~ "dectectionRate",
+    term == "detection_prevalence" ~ "dectectionPrevalence",
+    term == "balanced_accuracy" ~ "balancedAccuracy",
+    TRUE ~ term))
+
+# Clean up
+
+remove(trainXGBDMatrix,
+       xGBParameters, 
+       numberRounds,
+       numberFolds,
+       modelXGBCvInitial,
+       testLogLoss,
+       numberRoundsBest,
+       trainPredictions,
+       trainPredictionsBinary,
+       trainConfusionMatrix,
+       trainRoc,
+       trainAuc,
+       termAndEstimateXGBTrain)
+
+```
+
+#XGBoost test
+```{r}
+
+# Create DMatrix for XGBoost
+
+testXGBDMatrix <- 
+  xgb.DMatrix(data = testData, 
+              label = testLabels)
+
+# Predict on the testing dataset
+
+testPredictions <- 
+  predict(modelXGBCvFinal, 
+          newdata = testXGBDMatrix)
+
+# Convert predictions to binary classes based on a threshold (default: 0.5)
+
+testPredictionsBinary <- 
+  ifelse(testPredictions > 0.5, 1, 0)
+
+# Generate confusion matrix for the testing dataset
+
+testConfusionMatrix <- 
+  confusionMatrix(factor(testPredictionsBinary), 
+                  factor(testLabels), 
+                  mode = "everything")
+
+# Print the confusion matrix for the test dataset
+
+print(testConfusionMatrix)
+
+# Generate ROC curve object
+
+testRoc <- 
+  roc(response = testLabels, 
+      predictor = testPredictions)
+
+# Calculate the Area Under the Curve (AUC)
+
+testAuc <- 
+  auc(testRoc)
+
+# Print AUC
+
+print(testAuc)
+
+# Export confusion matrix
+
+termAndEstimateXGBTest <-
+  tidy(testConfusionMatrix)%>% 
+  filter(term %in% "accuracy") %>% 
+  select(conf.low, conf.high, p.value) %>% 
+  pivot_longer(everything(),
+               names_to = "term",
+               values_to = "estimate")
+
+confusionMatrixXGBTest <-
+  tidy(testConfusionMatrix) %>% 
+  mutate(estimate = case_when(
+    term == "mcnemar" ~ p.value,
+    TRUE ~ estimate)) %>% 
+  select(term, estimate) %>% 
+  bind_rows(termAndEstimateXGBTest) %>% 
+  bind_rows(tibble(term = "auc",
+                   estimate = as.numeric(testAuc))) %>% 
+  mutate(cellSpot = file_name) %>% 
+  mutate(model = "test") %>% 
+  arrange(match(term, c("accuracy", "conf.low", "conf.high", "p.value"))) %>% 
+  mutate(term = case_when(
+    term == "conf.low" ~ "ciLow",
+    term == "conf.high" ~ "ciHigh",
+    term == "p.value" ~ "pValue",
+    term == "pos_pred_value" ~ "positivePredictiveValue",
+    term == "neg_pred_value" ~ "negativePredictiveValue",
+    term == "detection_rate" ~ "dectectionRate",
+    term == "detection_prevalence" ~ "dectectionPrevalence",
+    term == "balanced_accuracy" ~ "balancedAccuracy",
+    TRUE ~ term))
+
+remove(testXGBDMatrix,
+       modelXGBCvFinal,
+       testPredictions,
+       testPredictionsBinary,
+       testConfusionMatrix,
+       testRoc,
+       testAuc,
+       termAndEstimateXGBTest)
+
+```
+
+
+#Grid Search 
+```{r}
+# Determine the number of cores
+
+numCores <- 
+  detectCores() - 1  # Reserve one core for system processes
+
+# Register the parallel backend
+
+registerDoParallel(cores=numCores)
+
+# Prepare data
+
+trainData <-
+  as.data.frame(trainData) %>% 
+  mutate(class = trainLabels) %>% 
+  mutate(class = factor(trainLabels, levels = c(0, 1), labels = c("Control", "Case"))) %>%
+  relocate(class)
+
+testData <-
+  as.data.frame(testData) %>% 
+  mutate(class = testLabels) %>% 
+  mutate(class = factor(testLabels, levels = c(0, 1), labels = c("Control", "Case"))) %>%
+  relocate(class)
+
+# Specify the training control
+
+trainControl <- 
+  trainControl(method = "cv", 
+               number = 5, 
+               allowParallel = TRUE, 
+               verboseIter = TRUE, 
+               returnData = FALSE, 
+               summaryFunction = twoClassSummary, 
+               classProbs = TRUE)
+
+# The trainControl function in the caret package is a powerful tool for setting up the training process for models. Here's a breakdown of the parameters you've specified:
+# method = "cv": This tells the training process to use cross-validation. Cross-validation is a resampling procedure used to evaluate predictive models by dividing the original sample into a training set to train the model and a validation (or testing) set to evaluate it.
+# number = 5: This specifies that the cross-validation should be 5-fold. In 5-fold cross-validation, the data set is partitioned into 5 subsets, and the model is trained and validated 5 times. Each time, one of the 5 subsets is used as the validation set, and the other 4 are combined into the training set.
+# allowParallel = TRUE: This enables parallel processing, allowing the cross-validation process to run on multiple cores if your computing environment supports it, which can significantly speed up the training process.
+# verboseIter = TRUE: This option makes the function print detailed progress messages to the console during training, which is useful for monitoring the training process or debugging.
+# returnData = FALSE: This prevents the function from including the original training data in the model object that's returned. This can save memory, especially when working with large datasets.
+# summaryFunction = twoClassSummary: This option specifies the function used to summarize the performance of the model. twoClassSummary is specifically designed for binary classification problems and will calculate several useful metrics such as sensitivity, specificity, and Area Under the ROC Curve (AUC).
+# classProbs = TRUE: This tells the model to return class probabilities in addition to the predicted classes. This is necessary for some types of summary functions, including twoClassSummary, as they require probability estimates to calculate certain metrics.
+
+# Define the grid of hyperparameters including subsample
+
+grid_complex <- 
+  expand.grid(
+    nrounds = c(50, 100, 150),
+    max_depth = c(3, 6, 9), # default is 6
+    eta = c(0.01, 0.1, 0.2, 0.3, 0.4), # default is 0.3. must be in [0,1]
+    gamma = c(0, 0.1, 0.2),
+    colsample_bytree = c(0.5, 0.75, 1), # default is 1
+    min_child_weight = c(0.25, 0.5, 1, 3, 5), #The larger, the more conservative the algorithm will be. Default: 1
+    subsample = c(0.5, 0.75, 1) # Including subsample. Default: 1
+)
+
+grid <- 
+  expand.grid(
+    eta = c(0.2, 0.3, 0.4),
+    max_depth = c(3, 6),
+    min_child_weight = c(1, 3),
+    gamma = c(0, 0.1),
+    subsample = c(0.75, 1.0),
+    colsample_bytree = c(0.75, 1.0),
+    nrounds = c(50, 100))
+
+# Fit the model
+
+modelXGBGrid <- 
+  caret::train(class ~ ., 
+        data = trainData, 
+        method = "xgbTree",
+        trControl = trainControl, 
+        tuneGrid = grid_complex, 
+        na.action = na.pass,
+        metric = "ROC")
+
+# View the best tuning parameters
+
+print(modelXGBGrid$bestTune)
+
+# Evaluate Model Performance: After identifying the best hyperparameters, evaluate the model's performance on the test set.
+
+# Make predictions
+
+predictions <- 
+  predict(modelXGBGrid, newdata = testData, na.action = na.pass)
+
+# Compute accuracy
+
+gridConfusionMatrix <-
+  confusionMatrix(predictions, testData$class)
+
+# Predict probabilities
+
+predictedProbabilities <- 
+  predict(modelXGBGrid, 
+          newdata = testData, 
+          type = "prob",
+          na.action = na.pass)
+
+# Compute AUROC
+
+gridRoc <- 
+  roc(response = testData$class, 
+      predictor = predictedProbabilities[,2])
+
+gridAuc <- 
+  auc(gridRoc)
+
+# Export confusion matrix
+
+termAndEstimateXGBGrid <-
+  tidy(gridConfusionMatrix) %>% 
+  filter(term %in% "accuracy") %>% 
+  select(conf.low, conf.high, p.value) %>% 
+  pivot_longer(everything(),
+               names_to = "term",
+               values_to = "estimate")
+
+confusionMatrixXGBGrid <-
+  tidy(gridConfusionMatrix) %>% 
+  mutate(estimate = case_when(
+    term == "mcnemar" ~ p.value,
+    TRUE ~ estimate)) %>% 
+  select(term, estimate) %>% 
+  bind_rows(termAndEstimateXGBGrid) %>% 
+  bind_rows(tibble(term = "auc",
+                   estimate = as.numeric(gridAuc))) %>% 
+  mutate(cellSpot = file_name) %>% 
+  mutate(model = "grid") %>% 
+  arrange(match(term, c("accuracy", "conf.low", "conf.high", "p.value"))) %>% 
+  mutate(term = case_when(
+    term == "conf.low" ~ "ciLow",
+    term == "conf.high" ~ "ciHigh",
+    term == "p.value" ~ "pValue",
+    term == "pos_pred_value" ~ "positivePredictiveValue",
+    term == "neg_pred_value" ~ "negativePredictiveValue",
+    term == "detection_rate" ~ "dectectionRate",
+    term == "detection_prevalence" ~ "dectectionPrevalence",
+    term == "balanced_accuracy" ~ "balancedAccuracy",
+    TRUE ~ term))
+
+remove(trainControl,
+       grid,
+       modelXGBGrid,
+       predictions,
+       gridConfusionMatrix,
+       predictedProbabilities,
+       gridRoc,
+       gridAuc,
+       termAndEstimateXGBGrid)
+
+```
+
+```{r}
+
+# Exclude the first column (class)
+
+rFFeatures <- 
+  data[, -1]  
+
+# The first column is the target variable
+
+# rFTarget <- 
+#   data[, 1] %>% 
+#   factor()
+
+rFTarget <- 
+  data$class %>%
+  factor()
+
+
+# For reproducibility
+
+set.seed(123)  
+
+# Initialize the cluster
+
+cl <- makeCluster(numCores)
+
+# Register the parallel backend
+
+registerDoParallel(cl)
+
+# Now run randomForest; it will use the parallel backend
+
+# modelRandomForest <- 
+#   randomForest(x = rFFeatures, 
+#                y = rFTarget, 
+#                importance = TRUE, 
+#                ntree = 500, 
+#                na.action = na.omit) # Example: specifying to grow 500 trees
+
+modelRandomForest <-
+  randomForest(factor(class) ~ ., 
+               data = data,
+               importance = TRUE,
+               ntree = 500,
+               na.action = na.omit)
+  
+# Stop the cluster after use
+
+stopCluster(cl)
+
+# Print the model to get a basic understanding of its performance
+
+print(modelRandomForest)
+
+# Extract and view the importance of each feature
+
+importance(modelRandomForest)
+
+# Save importance scores
+
+rFImportanceScores <- 
+  importance(modelRandomForest)
+
+# Sort the importance scores to identify top features
+
+rFSortedScores <- 
+  sort(rFImportanceScores[, "MeanDecreaseGini"], 
+       decreasing = TRUE) %>% 
+  tidy() %>% 
+  rename(feature = names) %>% 
+  rename(meanDecreaseGini = x)
+
+# List important features
+
+rFImportantFeatures <-
+  rFSortedScores %>% 
+  filter(meanDecreaseGini > 0) %>% 
+  arrange(feature) %>% 
+  pull (feature)
+
+remove(rFFeatures,
+       rFTarget,
+       cl,
+       modelRandomForest,
+       rFImportanceScores,
+       rFSortedScores)
+
+```
+
+# XGBoost · Grid × Random Forest
+
+```{r}
+
+# For trainData
+
+trainDataRFSubset <- 
+  trainData %>%
+  select(all_of(rFImportantFeatures))
+
+trainDataRFSubset <-
+  as.data.frame(trainDataRFSubset) %>% 
+  mutate(class = trainLabels) %>% 
+  mutate(class = factor(trainLabels, levels = c(0, 1), labels = c("Control", "Case"))) %>%
+  relocate(class)
+
+# For testData
+
+testDataRFSubset <- 
+  testData %>%
+  select(all_of(rFImportantFeatures))
+
+testDataRFSubset <-
+  as.data.frame(testDataRFSubset) %>% 
+  mutate(class = testLabels) %>% 
+  mutate(class = factor(testLabels, levels = c(0, 1), labels = c("Control", "Case"))) %>%
+  relocate(class)
+
+# Specify the training control
+
+trainControl <- 
+  trainControl(method = "cv", 
+               number = 5, 
+               allowParallel = TRUE, 
+               verboseIter = TRUE, 
+               returnData = FALSE, 
+               summaryFunction = twoClassSummary, 
+               classProbs = TRUE)
+
+# Define the grid of hyperparameters including subsample
+
+grid_complex <- 
+  expand.grid(
+    nrounds = c(50, 100, 150),
+    max_depth = c(3, 6, 9), # default is 6
+    eta = c(0.01, 0.1, 0.2, 0.3, 0.4), # default is 0.3. must be in [0,1]
+    gamma = c(0, 0.1, 0.2),
+    colsample_bytree = c(0.5, 0.75, 1), # default is 1
+    min_child_weight = c(0.25, 0.5, 1, 3, 5), #The larger, the more conservative the algorithm will be. Default: 1
+    subsample = c(0.5, 0.75, 1) # Including subsample. Default: 1
+)
+
+grid <- 
+  expand.grid(
+    eta = c(0.2, 0.3, 0.4),
+    max_depth = c(3, 6),
+    min_child_weight = c(1, 3),
+    gamma = c(0, 0.1),
+    subsample = c(0.75, 1.0),
+    colsample_bytree = c(0.75, 1.0),
+    nrounds = c(50, 100))
+
+# Initialize the cluster
+
+cl <- makeCluster(numCores)
+
+# Register the parallel backend
+
+registerDoParallel(cl)
+
+# Fit the model
+
+modelXGBGridRF <- 
+  train(class ~ ., 
+        data = trainDataRFSubset, 
+        method = "xgbTree",
+        trControl = trainControl, 
+        tuneGrid = grid_complex, 
+        metric = "ROC",
+        na.action = na.pass) # TODO: ROC?
+
+# Stop the cluster after use
+
+stopCluster(cl)
+
+# View the best tuning parameters
+
+print(modelXGBGridRF$bestTune)
+
+# Evaluate Model Performance: After identifying the best hyperparameters, evaluate the model's performance on the test set.
+
+# Make predictions
+
+predictions <- 
+  predict(modelXGBGridRF, 
+          newdata = testDataRFSubset,
+          na.action = na.pass)
+
+# Compute accuracy
+
+gridConfusionMatrix <-
+  confusionMatrix(predictions, testDataRFSubset$class)
+
+# Predict probabilities
+
+predictedProbabilities <- 
+  predict(modelXGBGridRF, 
+          newdata = testDataRFSubset, 
+          type = "prob",
+          na.action = na.pass)
+
+# Compute AUROC
+
+gridRoc <- 
+  roc(response = testDataRFSubset$class, 
+      predictor = predictedProbabilities[,2])
+
+gridAuc <- 
+  auc(gridRoc)
+
+# Export confusion matrix
+
+termAndEstimateXGBGridRF <-
+  tidy(gridConfusionMatrix) %>% 
+  filter(term %in% "accuracy") %>% 
+  select(conf.low, conf.high, p.value) %>% 
+  pivot_longer(everything(),
+               names_to = "term",
+               values_to = "estimate")
+
+confusionMatrixXGBGridRF <-
+  tidy(gridConfusionMatrix) %>% 
+  mutate(estimate = case_when(
+    term == "mcnemar" ~ p.value,
+    TRUE ~ estimate)) %>% 
+  select(term, estimate) %>% 
+  bind_rows(termAndEstimateXGBGridRF) %>% 
+  bind_rows(tibble(term = "auc",
+                   estimate = as.numeric(gridAuc))) %>% 
+  mutate(cellSpot = file_name) %>% 
+  mutate(model = "gridRandomForest") %>% 
+  arrange(match(term, c("accuracy", "conf.low", "conf.high", "p.value"))) %>% 
+  mutate(term = case_when(
+    term == "conf.low" ~ "ciLow",
+    term == "conf.high" ~ "ciHigh",
+    term == "p.value" ~ "pValue",
+    term == "pos_pred_value" ~ "positivePredictiveValue",
+    term == "neg_pred_value" ~ "negativePredictiveValue",
+    term == "detection_rate" ~ "dectectionRate",
+    term == "detection_prevalence" ~ "dectectionPrevalence",
+    term == "balanced_accuracy" ~ "balancedAccuracy",
+    TRUE ~ term))
+
+remove(trainDataRFSubset,
+       testDataRFSubset,
+       trainControl,
+       grid,
+       cl,
+       modelXGBGridRF,
+       predictions,
+       gridConfusionMatrix,
+       predictedProbabilities,
+       gridRoc,
+       gridAuc,
+       termAndEstimateXGBGridRF,
+       trainData,
+       testData,
+       trainLabels,
+       testLabels)
+
+```
+
+#Boruta feature selection
+
+```{r}
+# Set seed for reproducibility
+
+set.seed(123) 
+# Register parallel backend to use multiple cores
+
+numCores <- 
+  detectCores() - 1
+
+registerDoParallel(cores=numCores)
+
+# Conduct boruta
+
+borutaImportantFeatures <- 
+  Boruta(class ~ ., 
+         data = dataImputed, doTrace = 0)
+
+stopImplicitCluster()
+
+# Print the results
+
+print(borutaImportantFeatures)
+
+# Plot the results
+
+# plot(borutaImportantFeatures, cex.axis=.7, las=2, xlab="", main="Variable Importance")
+
+# Get the final decision of the Boruta algorithm and include tentative
+
+borutaImportantFeatures <- 
+  getSelectedAttributes(borutaImportantFeatures, 
+                        withTentative = T)
+
+remove(numCores)
+```
+
+#Bind confusion matrices
+```{r}
+
+confusionMatrixXGB <-
+  bind_rows(confusionMatrixXGBTest,
+            confusionMatrixXGBTrain,
+            confusionMatrixXGBGrid,
+            confusionMatrixXGBGridRF)
+            #confusionMatrixBayesian)
+
+remove(confusionMatrixXGBTest,
+       confusionMatrixXGBTrain,
+       confusionMatrixXGBGrid,
+       confusionMatrixXGBGridRF)
+       #confusionMatrixBayesian)
+
+```
+
+#End time
+
+```{r}
+# Record end time
+
+endTime <- 
+  Sys.time()
+
+# Calculate and print the duration
+
+duration <- 
+  endTime - startTime
+
+# Calculate total cells
+
+totalCells <- 
+  nrow(data) * ncol(data)
+
+time <- 
+  data.frame(
+  duration = duration,
+  totalCells = totalCells)
+
+remove(startTime,
+       endTime,
+       duration,
+       totalCells)
+
+```
+
+#Export to .xlsx
+```{r}
+# Create a new workbook
+
+workBook <- 
+  createWorkbook()
+
+# Add sheets and write data frames to them
+
+addWorksheet(workBook, "confusionMatrixXGB")
+writeData(workBook, sheet = "confusionMatrixXGB", confusionMatrixXGB)
+
+addWorksheet(workBook, "rFImportantFeatures")
+writeData(workBook, sheet = "rFImportantFeatures", rFImportantFeatures)
+
+addWorksheet(workBook, "borutaImportantFeatures")
+writeData(workBook, sheet = "borutaImportantFeatures", borutaImportantFeatures)
+
+addWorksheet(workBook, "time")
+writeData(workBook, sheet = "time", time)
+
+# Save the workbook
+
+saveWorkbook(workBook, paste0(file_name, ".xlsx"), overwrite = TRUE)
+
+remove(workBook,
+       confusionMatrixXGB,
+       rFImportantFeatures,
+       borutaImportantFeatures,
+       time)
+
+```
